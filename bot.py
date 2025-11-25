@@ -1,242 +1,227 @@
-import os
+from flask import Flask
+import requests
 import time
 import threading
 from datetime import datetime
-
-import requests
 import pytz
-from flask import Flask
 
-# ======================
-# CONFIG
-# ======================
+app = Flask(__name__)
+
+# ==============================
+# 🔹 TELEGRAM SETTINGS
+# ==============================
 TELEGRAM_TOKEN = "7265623033:AAFn8y8GO4W3GKbgzkaoFVqyBcpZ0JgGHJg"
 CHAT_ID = "1039559105"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]     # Coins to scan
-INTERVAL = "15m"                     # TIMEFRAME 15 minutes
+# ==============================
+# 🔹 SYMBOLS TO SCAN
+# ==============================
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 
-NY_TZ = pytz.timezone("America/New_York")
+# Track 1 trade per day (per symbol)
+last_trade_day = {sym: None for sym in SYMBOLS}
+
+# NY timezone
+ny_tz = pytz.timezone("America/New_York")
 
 
-# ======================
-# TELEGRAM
-# ======================
-def send_telegram(text: str) -> None:
-    """Send formatted message to Telegram"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-    }
+# ==============================================================
+# 🔹 TELEGRAM SENDER
+# ==============================================================
+def send_telegram(msg):
     try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"[ERROR] Telegram send fail: {e}")
+        print("Telegram error:", e)
 
 
-# ======================
-# BINANCE FAILOVER ENDPOINTS
-# ======================
-BINANCE_ENDPOINTS = [
-    "https://api1.binance.com/api/v3/klines",
-    "https://api2.binance.com/api/v3/klines",
-    "https://api3.binance.com/api/v3/klines",
-    "https://api-gcp.binance.com/api/v3/klines",
-    "https://api.binance.com/api/v3/klines",   # last fallback
-]
-
-
-def fetch_last_3_candles(symbol: str):
+# ==============================================================
+# 🔹 FETCH BINANCE FUTURES KLINES
+# ==============================================================
+def get_klines(symbol, limit=3):
     """
-    Try multiple Binance endpoints until one succeeds.
-    Returns list of 3 candles (open_time/open/high/low/close).
+    Pine Script logic uses:
+    C1 = close[2]
+    C2 = close[1]
+    C3 = close
+    
+    So we fetch 3 closed candles.
     """
-    params = {"symbol": symbol, "interval": INTERVAL, "limit": 3}
-
-    for endpoint in BINANCE_ENDPOINTS:
-        try:
-            r = requests.get(endpoint, params=params, timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                if len(data) >= 3:
-                    def parse(k):
-                        return {
-                            "open_time": int(k[0]),
-                            "open": float(k[1]),
-                            "high": float(k[2]),
-                            "low": float(k[3]),
-                            "close": float(k[4]),
-                        }
-                    return [parse(k) for k in data]
-                else:
-                    continue
-            else:
-                print(f"[WARN] Endpoint failed: {endpoint} → {r.status_code}")
-        except Exception as e:
-            print(f"[WARN] Endpoint error {endpoint}: {e}")
-            continue
-
-    print("[ERROR] All Binance endpoints failed.")
-    return None
+    url = f"https://fapi.binance.com/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": "15m", "limit": limit}
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        print(f"Kline error {symbol}: {e}")
+        return None
 
 
-# ======================
-# NY SESSION + DAILY RESET
-# ======================
-def is_ny_session() -> bool:
-    now = datetime.now(NY_TZ)
-    return (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and now.hour < 16
+# ==============================================================
+# 🔹 NEW YORK SESSION FILTER
+# ==============================================================
+def in_ny_session():
+    now = datetime.now(ny_tz)
+    hour = now.hour
+    minute = now.minute
+    return ((hour > 9 or (hour == 9 and minute >= 30)) and (hour < 16))
 
 
-traded_today = {s: False for s in SYMBOLS}
-last_signal_open_time = {s: None for s in SYMBOLS}
-last_day = None
+# ==============================================================
+# 🔹 PROCESS STRATEGY FOR ONE SYMBOL
+# ==============================================================
+def run_strategy(symbol):
+    global last_trade_day
 
+    # One-trade-per-day logic
+    today = datetime.now(ny_tz).date()
+    if last_trade_day.get(symbol) == today:
+        return  # Already traded today
 
-def reset_daily_flags_if_needed():
-    global last_day, traded_today
-    now_date = datetime.now(NY_TZ).date()
-    if last_day is None or now_date != last_day:
-        for s in traded_today.keys():
-            traded_today[s] = False
-        last_day = now_date
-        print(f"[INFO] New NY day: {now_date}. Reset flags.")
+    if not in_ny_session():
+        return  # Do nothing outside NY session
 
-
-# ======================
-# STRATEGY — 3 CANDLE BREAKOUT
-# ======================
-def check_symbol(symbol: str):
-    global traded_today, last_signal_open_time
-
-    candles = fetch_last_3_candles(symbol)
-    if candles is None:
+    # Get last 3 candles
+    k = get_klines(symbol, limit=3)
+    if not k or len(k) < 3:
         return
 
-    c1, c2, c3 = candles
+    # Parse candles
+    # Pine Script indexing:
+    # close[2] = c1 = oldest
+    # close[1] = c2
+    # close    = c3 = latest closed candle
+    c1, c2, c3 = k[0], k[1], k[2]
 
-    # Avoid duplicate signals for same candle
-    if last_signal_open_time[symbol] == c3["open_time"]:
-        return
+    o1, h1, l1, cl1 = float(c1[1]), float(c1[2]), float(c1[3]), float(c1[4])
+    o2, h2, l2, cl2 = float(c2[1]), float(c2[2]), float(c2[3]), float(c2[4])
+    o3, h3, l3, cl3 = float(c3[1]), float(c3[2]), float(c3[3]), float(c3[4])
 
-    # Candle 3 body % >= 70%
-    body3 = abs(c3["close"] - c3["open"])
-    range3 = c3["high"] - c3["low"]
-    if range3 <= 0:
-        return
-    if body3 / range3 < 0.70:
-        return
+    # ==========================================================
+    # 🔹 CANDLE 3 — 70% BODY FILTER
+    # ==========================================================
+    body3 = abs(cl3 - o3)
+    range3 = h3 - l3
+    body_percent = body3 / range3 if range3 > 0 else 0
+    candle3_is_70 = body_percent >= 0.70
 
-    # Short setup
-    c1_green = c1["close"] > c1["open"]
-    c1_body = abs(c1["close"] - c1["open"])
+    # ==========================================================
+    # 🔹 SHORT SETUP
+    # ==========================================================
+    s_c1_green = cl1 > o1
+    s_c1_body = abs(cl1 - o1)
 
-    c2_red = c2["close"] < c2["open"]
-    c2_body = abs(c2["close"] - c2["open"])
-    c2_small = c2_body < c1_body
+    s_c2_red = cl2 < o2
+    s_c2_body = abs(cl2 - o2)
+    s_c2_small_body = s_c2_body < s_c1_body
 
-    c1_low = min(c1["open"], c1["close"])
-    breakdown = c3["close"] < c1_low
+    s_c1_body_low = min(o1, cl1)
+    s_breakdown = cl3 < s_c1_body_low
 
-    short_pattern = c1_green and c2_red and c2_small and breakdown
+    shortPattern = s_c1_green and s_c2_red and s_c2_small_body and s_breakdown and candle3_is_70
 
-    # Long setup
-    c1_red = c1["close"] < c1["open"]
-    c2_green = c2["close"] > c2["open"]
-    c2_small_l = c2_body < c1_body
+    # ==========================================================
+    # 🔹 LONG SETUP
+    # ==========================================================
+    l_c1_red = cl1 < o1
+    l_c1_body = abs(cl1 - o1)
 
-    c1_high = max(c1["open"], c1["close"])
-    breakout = c3["close"] > c1_high
+    l_c2_green = cl2 > o2
+    l_c2_body = abs(cl2 - o2)
+    l_c2_small_body = l_c2_body < l_c1_body
 
-    long_pattern = c1_red and c2_green and c2_small_l and breakout
+    l_c1_body_high = max(o1, cl1)
+    l_breakout = cl3 > l_c1_body_high
 
-    if not (short_pattern or long_pattern):
-        return
+    longPattern = l_c1_red and l_c2_green and l_c2_small_body and l_breakout and candle3_is_70
 
-    if not is_ny_session():
-        return
+    # ==========================================================
+    # 🔹 STOP LOSS & TAKE PROFIT (1:1.5)
+    # ==========================================================
 
-    if traded_today[symbol]:
-        return
+    # Short
+    short_sl = max(o2, cl2)
+    short_entry = cl3
+    short_risk = short_sl - short_entry
+    short_tp = short_entry - 1.5 * short_risk if short_risk > 0 else None
 
-    entry = c3["close"]
-    now_str = datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M")
+    # Long
+    long_sl = min(o2, cl2)
+    long_entry = cl3
+    long_risk = long_entry - long_sl
+    long_tp = long_entry + 1.5 * long_risk if long_risk > 0 else None
 
-    if short_pattern:
-        sl = max(c2["open"], c2["close"])
-        risk = sl - entry
-        if risk <= 0:
-            return
-        tp = entry - 1.5 * risk
+    # ==========================================================
+    # 🔹 DECISION LOGIC
+    # ==========================================================
+    if longPattern and long_risk > 0:
+        last_trade_day[symbol] = today
 
-        msg = (
-            f"🔻 <b>SHORT SIGNAL</b>\n"
-            f"Symbol: {symbol}\nTime: {now_str}\n\n"
-            f"Entry: {entry:.2f}\n"
-            f"SL: {sl:.2f}\n"
-            f"TP (1:1.5): {tp:.2f}"
-        )
+        msg = f"""
+📢 <b>LONG ENTRY</b> — 3-Candle Strategy  
+<b>Symbol:</b> {symbol}
+
+<b>Entry:</b> {long_entry}
+<b>SL:</b> {long_sl}
+<b>TP (1:1.5):</b> {long_tp}
+
+<b>Body 3%:</b> {round(body_percent * 100, 1)}%
+<b>Session:</b> New York
+<b>Time:</b> {datetime.now(ny_tz).strftime("%Y-%m-%d %H:%M")}
+"""
         send_telegram(msg)
-        traded_today[symbol] = True
-        last_signal_open_time[symbol] = c3["open_time"]
+        print(msg)
+        return
 
-    if long_pattern:
-        sl = min(c2["open"], c2["close"])
-        risk = entry - sl
-        if risk <= 0:
-            return
-        tp = entry + 1.5 * risk
+    if shortPattern and short_risk > 0:
+        last_trade_day[symbol] = today
 
-        msg = (
-            f"🚀 <b>LONG SIGNAL</b>\n"
-            f"Symbol: {symbol}\nTime: {now_str}\n\n"
-            f"Entry: {entry:.2f}\n"
-            f"SL: {sl:.2f}\n"
-            f"TP (1:1.5): {tp:.2f}"
-        )
+        msg = f"""
+📢 <b>SHORT ENTRY</b> — 3-Candle Strategy  
+<b>Symbol:</b> {symbol}
+
+<b>Entry:</b> {short_entry}
+<b>SL:</b> {short_sl}
+<b>TP (1:1.5):</b> {short_tp}
+
+<b>Body 3%:</b> {round(body_percent * 100, 1)}%
+<b>Session:</b> New York
+<b>Time:</b> {datetime.now(ny_tz).strftime("%Y-%m-%d %H:%M")}
+"""
         send_telegram(msg)
-        traded_today[symbol] = True
-        last_signal_open_time[symbol] = c3["open_time"]
+        print(msg)
+        return
 
 
-# ======================
-# BACKGROUND LOOP
-# ======================
-def worker_loop():
-    print("[INFO] Worker loop started.")
+# ==============================================================
+# 🔹 BACKGROUND LOOP
+# ==============================================================
+def strategy_loop():
+    print("Strategy running (NY Session + 1 trade/day + 70% body rule)")
+
     while True:
-        try:
-            reset_daily_flags_if_needed()
-            for s in SYMBOLS:
-                check_symbol(s)
-        except Exception as e:
-            print(f"[ERROR] Worker loop error: {e}")
-        time.sleep(60)  # runs every 1 minute
+        for sym in SYMBOLS:
+            run_strategy(sym)
+
+        time.sleep(60)  # check every minute
 
 
-# ======================
-# FLASK SERVER (Render)
-# ======================
-app = Flask(__name__)
-
-
+# ==============================================================
+# 🔹 FLASK HEALTH CHECK
+# ==============================================================
 @app.route("/")
 def home():
-    return "BTC/ETH 3-Candle bot is running.", 200
+    return "Python 3-Candle Strategy (NY Session + 1 Trade/Day)"
 
 
-@app.route("/test")
-def test():
-    send_telegram("✅ Test message from /test endpoint.")
-    return "Sent test message to Telegram.", 200
-
-
-# ======================
-# MAIN ENTRY
-# ======================
+# ==============================================================
+# 🔹 START BOT
+# ==============================================================
 if __name__ == "__main__":
-    threading.Thread(target=worker_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    t = threading.Thread(target=strategy_loop, daemon=True)
+    t.start()
+
+    app.run(host="0.0.0.0", port=10000)
