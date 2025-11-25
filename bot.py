@@ -14,7 +14,7 @@ TELEGRAM_TOKEN = "7265623033:AAFn8y8GO4W3GKbgzkaoFVqyBcpZ0JgGHJg"
 CHAT_ID = "1039559105"
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]   # BTC & ETH
-INTERVAL = "5m"                    # Candle timeframe
+INTERVAL = "15m"                    # Candle timeframe
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 NY_TZ = pytz.timezone("America/New_York")
