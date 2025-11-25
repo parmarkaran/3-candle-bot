@@ -1,3 +1,5 @@
 flask
 requests
 pytz
+yfinance
+pandas
