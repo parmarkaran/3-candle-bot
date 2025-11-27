@@ -1,5 +1,7 @@
 flask
 requests
 pytz
-yfinance
 pandas
+yfinance
+numpy
+gunicorn
