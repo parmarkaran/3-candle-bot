@@ -247,6 +247,11 @@ def home():
 def health():
     return "ok"
 
+@app.route("/test")
+def test_message():
+    send_telegram("🚀 *Test Message:* Your bot is working!")
+    return "Test message sent!"
+
 
 # =====================================================
 # 🔹 START THREAD
