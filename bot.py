@@ -21,7 +21,7 @@ import pandas as pd
 app = Flask(__name__)
 
 # YOUR TELEGRAM CREDENTIALS
-TELEGRAM_TOKEN = "7265623033:AAFn8y8GO4W3GKbgzkaoFVqyBcpZ0JgGHJg"
+TELEGRAM_TOKEN = "8184326642:AAHOkXm5MaLH1f58YtsRc9xNAN3QbEl_hNs"
 CHAT_ID = "1039559105"
 
 # Symbols (yfinance tickers)
