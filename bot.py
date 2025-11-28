@@ -1,442 +1,435 @@
-# ============================================================
-# 3-Candle Reversal + Breakout Strategy Bot
-# With:
-# - Breakeven trailing (+1R)
-# - Fixed sizes
-# - NY session filter
-# - 1 trade/day/symbol
-# - Full logging system
-# - Signal history (even skipped)
-# - Performance tracking
-# - Daily report
-# - Flask dashboard endpoints
-# ============================================================
+# bot.py
+# =====================================================
+# 3-Candle Break Strategy (15m, Unlimited Trades, 1 Signal/Candle)
+# Candle CLOSE logic (NY Time) + Telegram Alerts + HTML Logs
+# + Win-Rate Tracking (auto TP/SL detection)
+# =====================================================
 
 from flask import Flask
+import requests
 import threading
 import time
+from datetime import datetime, timedelta
 import os
-from datetime import datetime
-
-import requests
 import pytz
 import yfinance as yf
 import pandas as pd
-import ccxt
 
-# ============================================================
+# =====================================================
 # 🔹 CONFIG
-# ============================================================
+# =====================================================
 app = Flask(__name__)
 
-# Insert your keys locally — DO NOT PASTE HERE
 TELEGRAM_TOKEN = "8184326642:AAHOkXm5MaLH1f58YtsRc9xNAN3QbEl_hNs"
 CHAT_ID = "1039559105"  # confirmed from getUpdates
 
-MEXC_API_KEY = "mx0vglytZwiliiKIOK"
-MEXC_API_SECRET = "b44bf509cb7d46e9a6ee338c20b0f777"
-
 SYMBOLS = ["BTC-USD", "ETH-USD"]
-MEXC_SYMBOL_MAP = {
-    "BTC-USD": "BTC/USDT:USDT",
-    "ETH-USD": "ETH/USDT:USDT",
-}
-
-FIXED_SIZES = {
-    "BTC/USDT:USDT": 0.05,
-    "ETH/USDT:USDT": 0.5,
-}
-
-RR = 1.5
 NY_TZ = pytz.timezone("America/New_York")
 
-# Logging
+# one-signal-per-candle tracking
+last_signal_candle = {sym: None for sym in SYMBOLS}
+
+# trades tracking
+open_trades = []   # list of dicts
+closed_trades = []  # list of dicts
+
+# logs for /logs page (entries + result)
 logs = []
-closed_trades = []
-signal_history = []
 
 
-# ============================================================
+# =====================================================
 # 🔹 TELEGRAM
-# ============================================================
-def send_telegram(msg):
+# =====================================================
+def send_telegram(message: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
-    except:
-        print("Telegram error")
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+        }
+        res = requests.post(url, json=payload, timeout=10)
+        print("Telegram:", res.status_code, res.text)
+    except Exception as e:
+        print("❌ Telegram Error:", e)
 
 
-# ============================================================
-# 🔹 MEXC FUTURES
-# ============================================================
-def init_mexc():
-    return ccxt.mexc({
-        "apiKey": MEXC_API_KEY,
-        "secret": MEXC_API_SECRET,
-        "options": {"defaultType": "swap"},
-        "enableRateLimit": True
-    })
-
-mexc = init_mexc()
-
-def get_futures_price(symbol):
+# =====================================================
+# 🔹 DATA FETCHING
+# =====================================================
+def get_latest_klines(symbol):
+    """Get last 3 x 15m candles using yfinance."""
     try:
-        return float(mexc.fetch_ticker(symbol)["last"])
-    except:
+        df = yf.download(
+            interval="15m",
+            period="1d",
+            tickers=symbol,
+            progress=False,
+        )
+        if df is None or df.empty or len(df) < 3:
+            return None
+        return df.tail(3)
+    except Exception as e:
+        print(f"❌ yfinance error for {symbol}: {e}")
         return None
 
 
-# ============================================================
-# 🔹 YFINANCE
-# ============================================================
-def get_15m(symbol):
+def get_recent_klines(symbol, days=2):
+    """Get recent candles for TP/SL checking."""
     try:
-        df = yf.download(symbol, interval="15m", period="2d", progress=False)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.rename(columns=str.lower)
-        return df[["open", "high", "low", "close"]]
-    except:
-        return pd.DataFrame()
-
-
-# ============================================================
-# 🔹 STRATEGY LOGIC (Updated Version)
-# ============================================================
-def get_three_candle_signal(df):
-    if len(df) < 3:
-        return None, None, None, None
-
-    C1, C2, C3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-
-    C2_body_low = min(C2["open"], C2["close"])
-    C2_body_high = max(C2["open"], C2["close"])
-    entry_ref = float(C3["close"])
-
-    # LONG
-    if (
-        C1["close"] < C1["open"] and
-        C2["close"] > C2["open"] and
-        C2["high"] < C1["high"] and
-        C3["close"] > C1["high"]
-    ):
-        sl_ref = float(C2_body_low)
-        sl_dist = entry_ref - sl_ref
-        if sl_dist <= 0:
-            return None, None, None, None
-        tp_ref = entry_ref + RR * sl_dist
-        return "long", entry_ref, sl_ref, tp_ref
-
-    # SHORT
-    if (
-        C1["close"] > C1["open"] and
-        C2["close"] < C2["open"] and
-        C2["low"] > C1["low"] and
-        C3["close"] < C1["low"]
-    ):
-        sl_ref = float(C2_body_high)
-        sl_dist = sl_ref - entry_ref
-        if sl_dist <= 0:
-            return None, None, None, None
-        tp_ref = entry_ref - RR * sl_dist
-        return "short", entry_ref, sl_ref, tp_ref
-
-    return None, None, None, None
-
-
-# ============================================================
-# 🔹 POSITION HANDLING (with Breakeven + Logging)
-# ============================================================
-open_positions = {}
-
-def open_position(symbol, side, entry, sl, tp):
-    size = FIXED_SIZES.get(symbol)
-    if not size:
-        return False
-
-    oneR = abs(entry - sl)
-    now_ny = datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-    # Log signal (executed)
-    signal_history.append({
-        "time": now_ny,
-        "symbol": symbol,
-        "side": side.upper(),
-        "entry_ref": entry,
-        "sl_ref": sl,
-        "tp_ref": tp,
-        "status": "EXECUTED"
-    })
-
-    try:
-        mexc.create_order(symbol=symbol, type="market",
-                          side="buy" if side == "long" else "sell",
-                          amount=size)
-
-        log_idx = len(logs)
-        logs.append({
-            "time": now_ny,
-            "symbol": symbol,
-            "side": side.upper(),
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "status": "OPEN",
-            "result": ""
-        })
-
-        open_positions[symbol] = {
-            "side": side,
-            "size": size,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "oneR": oneR,
-            "moved_to_be": False,
-            "log_index": log_idx
-        }
-
-        send_telegram(
-            f"🟩 {symbol} {side.upper()} EXECUTED\nEntry: {entry}\nSL: {sl}\nTP: {tp}"
+        df = yf.download(
+            interval="15m",
+            period=f"{days}d",
+            tickers=symbol,
+            progress=False,
         )
-        return True
-
+        if df is None or df.empty:
+            return None
+        return df
     except Exception as e:
-        print("Execution error:", e)
-        return False
+        print(f"❌ yfinance error (recent) for {symbol}: {e}")
+        return None
 
 
-def close_position(symbol, reason):
-    pos = open_positions.get(symbol)
-    if not pos:
+# =====================================================
+# 🔹 STRATEGY LOGIC
+# =====================================================
+def run_strategy_for_symbol(symbol):
+    global last_signal_candle, open_trades, logs
+
+    df = get_latest_klines(symbol)
+    if df is None:
         return
 
-    entry = pos["entry"]
-    oneR = pos["oneR"]
-    moved_to_be = pos["moved_to_be"]
+    c1, c2, c3 = df.iloc[0], df.iloc[1], df.iloc[2]
 
-    price = get_futures_price(symbol)
-    if price is None:
-        price = entry
+    # yfinance index is candle CLOSE time (UTC or tz-aware)
+    c3_time = df.index[2]
+    if c3_time.tzinfo is None:
+        c3_time = pytz.utc.localize(c3_time)
+    c3_time_ny = c3_time.astimezone(NY_TZ)
 
-    # Determine status
-    if reason == "TP":
-        status = "WIN"
-        r_mult = (price - entry) / oneR if pos["side"] == "long" else (entry - price) / oneR
-    elif reason == "SL":
-        if moved_to_be and abs(price - entry) < 1e-8:
-            status = "BE"
-            r_mult = 0.0
-        else:
-            status = "LOSS"
-            r_mult = (price - entry) / oneR if pos["side"] == "long" else (entry - price) / oneR
-    else:
-        status = reason
-        r_mult = 0.0
+    now_ny = datetime.now(NY_TZ)
+    if now_ny < c3_time_ny:
+        # last candle not closed yet
+        return
 
-    # Close futures position
-    try:
-        mexc.create_order(symbol=symbol, type="market",
-                          side="sell" if pos["side"] == "long" else "buy",
-                          amount=pos["size"],
-                          params={"reduceOnly": True})
-    except:
-        pass
+    # one-signal-per-candle
+    if last_signal_candle.get(symbol) == c3_time_ny:
+        print(f"{symbol}: already signaled for {c3_time_ny}")
+        return
 
-    exit_time = datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    # OHLC as floats
+    o1, h1, l1, cl1 = map(float, [c1["Open"], c1["High"], c1["Low"], c1["Close"]])
+    o2, h2, l2, cl2 = map(float, [c2["Open"], c2["High"], c2["Low"], c2["Close"]])
+    o3, h3, l3, cl3 = map(float, [c3["Open"], c3["High"], c3["Low"], c3["Close"]])
 
-    # Update log
-    idx = pos["log_index"]
-    logs[idx]["status"] = status
-    logs[idx]["result"] = f"{reason} ({r_mult:+.2f}R)"
+    # Candle 3 – 70% body rule
+    body3 = abs(cl3 - o3)
+    range3 = h3 - l3
+    body_percent3 = (body3 / range3) if range3 > 0 else 0
+    candle3_is_70 = body_percent3 >= 0.70
 
-    closed_trades.append({
-        "entry_time_ny": logs[idx]["time"],
-        "symbol": symbol,
-        "side": pos["side"].upper(),
-        "entry": entry,
-        "sl": pos["sl"],
-        "tp": pos["tp"],
-        "exit_time_ny": exit_time,
-        "exit_price": price,
-        "status": status,
-        "r_multiple": r_mult
-    })
+    # SHORT setup
+    s_c1_green = cl1 > o1
+    s_c2_red = cl2 < o2
+    s_c2_small = abs(cl2 - o2) < abs(cl1 - o1)
+    s_breakdown = cl3 < min(o1, cl1)
 
-    send_telegram(f"📉 {symbol} {status} by {reason} ({r_mult:+.2f}R)")
-
-    open_positions.pop(symbol, None)
-
-
-def monitor_positions():
-    to_close = []
-
-    for sym, pos in list(open_positions.items()):
-        price = get_futures_price(sym)
-        if price is None:
-            continue
-
-        entry = pos["entry"]
-        sl = pos["sl"]
-        tp = pos["tp"]
-        oneR = pos["oneR"]
-
-        # Move SL to BE
-        if pos["side"] == "long":
-            if not pos["moved_to_be"] and price >= entry + oneR:
-                pos["sl"] = entry
-                pos["moved_to_be"] = True
-                send_telegram(f"🔵 {sym} LONG SL moved to breakeven")
-            if price <= pos["sl"]:
-                to_close.append((sym, "SL"))
-            elif price >= tp:
-                to_close.append((sym, "TP"))
-
-        else:  # SHORT
-            if not pos["moved_to_be"] and price <= entry - oneR:
-                pos["sl"] = entry
-                pos["moved_to_be"] = True
-                send_telegram(f"🔵 {sym} SHORT SL moved to breakeven")
-            if price >= pos["sl"]:
-                to_close.append((sym, "SL"))
-            elif price <= tp:
-                to_close.append((sym, "TP"))
-
-    for sym, reason in to_close:
-        close_position(sym, reason)
-
-
-# ============================================================
-# 🔹 NY SESSION + ONE TRADE PER DAY
-# ============================================================
-last_trade_day = {sym: None for sym in SYMBOLS}
-
-def in_ny_session():
-    now = datetime.now(NY_TZ)
-    h, m = now.hour, now.minute
-    return (h > 9 or (h == 9 and m >= 30)) and (h < 16)
-
-def today_ny():
-    return datetime.now(NY_TZ).date()
-
-
-# ============================================================
-# 🔹 DAILY REPORT
-# ============================================================
-def send_daily_report():
-    today = str(today_ny())
-    todays = [t for t in closed_trades if t["exit_time_ny"].startswith(today)]
-
-    wins = sum(1 for t in todays if t["status"] == "WIN")
-    losses = sum(1 for t in todays if t["status"] == "LOSS")
-    be = sum(1 for t in todays if t["status"] == "BE")
-    total_r = sum(t["r_multiple"] for t in todays)
-
-    msg = (
-        "📊 *Daily Report*\n"
-        f"Trades today: {len(todays)}\n"
-        f"Wins: {wins}\nLosses: {losses}\nBreakeven: {be}\n"
-        f"Total R today: {total_r:+.2f}R\n"
+    short_pattern = (
+        s_c1_green and s_c2_red and s_c2_small and
+        s_breakdown and candle3_is_70
     )
 
-    send_telegram(msg)
+    # LONG setup
+    l_c1_red = cl1 < o1
+    l_c2_green = cl2 > o2
+    l_c2_small = abs(cl2 - o2) < abs(cl1 - o1)
+    l_breakout = cl3 > max(o1, cl1)
+
+    long_pattern = (
+        l_c1_red and l_c2_green and l_c2_small and
+        l_breakout and candle3_is_70
+    )
+
+    # Risk/Reward 1:1.5
+    short_sl = max(o2, cl2)
+    short_entry = cl3
+    short_risk = short_sl - short_entry
+    short_tp = short_entry - 1.5 * short_risk if short_risk > 0 else None
+
+    long_sl = min(o2, cl2)
+    long_entry = cl3
+    long_risk = long_entry - long_sl
+    long_tp = long_entry + 1.5 * long_risk if long_risk > 0 else None
+
+    now_str = now_ny.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---- SHORT ENTRY ----
+    if short_pattern and short_risk > 0:
+        msg = (
+            f"🔻 *3-Candle SHORT*\n"
+            f"Symbol: `{symbol}`\n"
+            f"Entry: `{short_entry:.2f}`\n"
+            f"SL: `{short_sl:.2f}`\n"
+            f"TP (1.5R): `{short_tp:.2f}`\n"
+            f"Time (NY): {now_str}\n"
+            f"Body3: `{body_percent3*100:.1f}%`"
+        )
+        send_telegram(msg)
+        last_signal_candle[symbol] = c3_time_ny
+
+        trade = {
+            "id": len(open_trades) + len(closed_trades) + 1,
+            "symbol": symbol,
+            "side": "SHORT",
+            "entry": short_entry,
+            "sl": short_sl,
+            "tp": short_tp,
+            "entry_time_utc": c3_time,     # yfinance index
+            "entry_time_ny": now_str,
+            "status": "OPEN",
+        }
+        open_trades.append(trade)
+        logs.append({
+            "time": now_str,
+            "symbol": symbol,
+            "side": "SHORT",
+            "entry": f"{short_entry:.2f}",
+            "sl": f"{short_sl:.2f}",
+            "tp": f"{short_tp:.2f}",
+            "status": "OPEN",
+            "result": "",
+        })
+        print(f"{symbol}: SHORT signal at {now_str}")
+        return
+
+    # ---- LONG ENTRY ----
+    if long_pattern and long_risk > 0:
+        msg = (
+            f"🔺 *3-Candle LONG*\n"
+            f"Symbol: `{symbol}`\n"
+            f"Entry: `{long_entry:.2f}`\n"
+            f"SL: `{long_sl:.2f}`\n"
+            f"TP (1.5R): `{long_tp:.2f}`\n"
+            f"Time (NY): {now_str}\n"
+            f"Body3: `{body_percent3*100:.1f}%`"
+        )
+        send_telegram(msg)
+        last_signal_candle[symbol] = c3_time_ny
+
+        trade = {
+            "id": len(open_trades) + len(closed_trades) + 1,
+            "symbol": symbol,
+            "side": "LONG",
+            "entry": long_entry,
+            "sl": long_sl,
+            "tp": long_tp,
+            "entry_time_utc": c3_time,
+            "entry_time_ny": now_str,
+            "status": "OPEN",
+        }
+        open_trades.append(trade)
+        logs.append({
+            "time": now_str,
+            "symbol": symbol,
+            "side": "LONG",
+            "entry": f"{long_entry:.2f}",
+            "sl": f"{long_sl:.2f}",
+            "tp": f"{long_tp:.2f}",
+            "status": "OPEN",
+            "result": "",
+        })
+        print(f"{symbol}: LONG signal at {now_str}")
+        return
+
+    print(f"{symbol}: no signal on candle {c3_time_ny}")
 
 
-# ============================================================
-# 🔹 MAIN LOOP
-# ============================================================
-def bot_loop():
-    last_candle_time = {sym: None for sym in SYMBOLS}
-    last_report_day = None
+# =====================================================
+# 🔹 WIN-RATE TRACKING (TP/SL CHECK)
+# =====================================================
+def check_open_trades():
+    """
+    For each open trade:
+      - download recent 15m candles
+      - check if TP or SL was hit
+      - close trade as WIN / LOSS / EXPIRED
+    """
+    global open_trades, closed_trades, logs
 
-    print("Bot running...")
+    if not open_trades:
+        return
 
+    print(f"🔎 Checking {len(open_trades)} open trade(s) for TP/SL...")
+
+    # group trades by symbol so we fetch data per symbol once
+    symbols_with_open = sorted(set(t["symbol"] for t in open_trades))
+
+    recent_data = {}
+    for sym in symbols_with_open:
+        df = get_recent_klines(sym, days=2)
+        if df is not None and not df.empty:
+            recent_data[sym] = df
+
+    remaining_open = []
+    max_bars_open = 40  # ~10 hours on 15m
+
+    for trade in open_trades:
+        sym = trade["symbol"]
+        df = recent_data.get(sym)
+        if df is None:
+            remaining_open.append(trade)
+            continue
+
+        entry_time_utc = trade["entry_time_utc"]
+        # make sure df index is tz-aware UTC
+        idx = df.index
+        if idx.tzinfo is None:
+            df.index = pytz.utc.localize(idx[0]).tzinfo.localize(idx[0])  # quick fix
+        # filter candles after entry
+        subset = df[df.index > entry_time_utc]
+
+        if subset.empty:
+            remaining_open.append(trade)
+            continue
+
+        closed = False
+        side = trade["side"]
+        entry = trade["entry"]
+        sl = trade["sl"]
+        tp = trade["tp"]
+
+        bars_checked = 0
+        for ts, row in subset.iterrows():
+            hi = float(row["High"])
+            lo = float(row["Low"])
+            bars_checked += 1
+
+            if side == "LONG":
+                # conservative: if both hit in same bar, assume SL first
+                if lo <= sl:
+                    status = "LOSS"
+                    exit_price = sl
+                    r_mult = -1.0
+                    closed = True
+                elif hi >= tp:
+                    status = "WIN"
+                    exit_price = tp
+                    r_mult = (tp - entry) / abs(entry - sl) if entry != sl else 1.5
+                    closed = True
+
+            else:  # SHORT
+                if hi >= sl:
+                    status = "LOSS"
+                    exit_price = sl
+                    r_mult = -1.0
+                    closed = True
+                elif lo <= tp:
+                    status = "WIN"
+                    exit_price = tp
+                    r_mult = (entry - tp) / abs(sl - entry) if entry != sl else 1.5
+                    closed = True
+
+            if closed:
+                exit_time_utc = ts
+                exit_time_ny = exit_time_utc.tz_convert(NY_TZ)
+                exit_str = exit_time_ny.strftime("%Y-%m-%d %H:%M:%S")
+
+                trade["status"] = status
+                trade["exit_price"] = exit_price
+                trade["exit_time_utc"] = exit_time_utc
+                trade["exit_time_ny"] = exit_str
+                trade["r_multiple"] = round(r_mult, 2)
+
+                closed_trades.append(trade)
+
+                # update logs entry for this trade (match by id)
+                for log in logs:
+                    if (log["symbol"] == sym and
+                        log["side"] == side and
+                        log["time"] == trade["entry_time_ny"]):
+                        log["status"] = status
+                        log["result"] = f"{r_mult:+.2f}R"
+                        break
+
+                print(f"{sym} {side} {status} at {exit_str}, R={r_mult:+.2f}")
+                break
+
+            if bars_checked >= max_bars_open:
+                # expire trade
+                exit_time_utc = ts
+                exit_time_ny = exit_time_utc.tz_convert(NY_TZ)
+                exit_str = exit_time_ny.strftime("%Y-%m-%d %H:%M:%S")
+
+                trade["status"] = "EXPIRED"
+                trade["exit_price"] = float(row["Close"])
+                trade["exit_time_utc"] = exit_time_utc
+                trade["exit_time_ny"] = exit_str
+                trade["r_multiple"] = 0.0
+
+                closed_trades.append(trade)
+
+                for log in logs:
+                    if (log["symbol"] == sym and
+                        log["side"] == side and
+                        log["time"] == trade["entry_time_ny"]):
+                        log["status"] = "EXPIRED"
+                        log["result"] = "0.00R"
+                        break
+
+                print(f"{sym} {side} EXPIRED at {exit_str}")
+                closed = True
+                break
+
+        if not closed:
+            remaining_open.append(trade)
+
+    open_trades = remaining_open
+
+
+# =====================================================
+# 🔹 STRATEGY LOOP — EXACT 15m CANDLE CLOSE
+# =====================================================
+def strategy_loop():
+    print("🚀 Strategy Loop Started (15m close mode + win-rate tracking)")
     while True:
         try:
-            monitor_positions()
-
             now_ny = datetime.now(NY_TZ)
-            today = today_ny()
+            minute = now_ny.minute
 
-            # Daily report
-            if now_ny.hour == 16 and now_ny.minute == 1 and last_report_day != today:
-                send_daily_report()
-                last_report_day = today
+            next_q = (minute // 15 + 1) * 15
+            if next_q >= 60:
+                next_close = now_ny.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            else:
+                next_close = now_ny.replace(minute=next_q, second=0, microsecond=0)
 
-            if not in_ny_session():
-                time.sleep(30)
-                continue
+            sleep_s = (next_close - now_ny).total_seconds() + 5
+            if sleep_s < 5:
+                sleep_s = 5
 
-            for yf_symbol in SYMBOLS:
+            print(f"⏳ Sleeping {sleep_s:.1f}s until next candle close at {next_close} NY time")
+            time.sleep(sleep_s)
 
-                df = get_15m(yf_symbol)
-                if df.empty:
-                    continue
-
-                last_candle = df.index[-1]
-                if last_candle_time[yf_symbol] == last_candle:
-                    continue
-
-                last_candle_time[yf_symbol] = last_candle
-
-                # Evaluate signal
-                side, entry_ref, sl_ref, tp_ref = get_three_candle_signal(df)
-                if side is None:
-                    continue
-
-                mexc_symbol = MEXC_SYMBOL_MAP[yf_symbol]
-
-                # Record signal (executed or skipped)
-                now_ny_str = now_ny.strftime("%Y-%m-%d %H:%M:%S")
-
-                live = get_futures_price(mexc_symbol)
-                if live is None:
-                    continue
-
-                sl_dist = abs(entry_ref - sl_ref)
-                if sl_dist <= 0:
-                    continue
-
-                # Shift SL/TP around live entry
-                if side == "long":
-                    sl = live - sl_dist
-                    tp = live + RR * sl_dist
-                else:
-                    sl = live + sl_dist
-                    tp = live - RR * sl_dist
-
-                # Skip trade if already taken today
-                if last_trade_day[yf_symbol] == today:
-                    signal_history.append({
-                        "time": now_ny_str,
-                        "symbol": yf_symbol,
-                        "side": side.upper(),
-                        "entry_ref": entry_ref,
-                        "sl_ref": sl_ref,
-                        "tp_ref": tp_ref,
-                        "status": "SKIPPED (limit reached)"
-                    })
-                    send_telegram(f"⚠️ {yf_symbol} signal detected but trade skipped (daily limit reached)")
-                    continue
-
-                # Execute trade
-                if open_position(mexc_symbol, side, live, sl, tp):
-                    last_trade_day[yf_symbol] = today
+            print("🔔 15m candle closed — checking trades and new signals...")
+            # 1) check existing trades
+            check_open_trades()
+            # 2) look for new entries
+            for sym in SYMBOLS:
+                run_strategy_for_symbol(sym)
+                time.sleep(1)
 
         except Exception as e:
-            print("Main loop error:", e)
+            print("❌ Strategy Loop Error:", e)
+            time.sleep(10)
 
-        time.sleep(30)
 
-
-# ============================================================
-# 🔹 FLASK ENDPOINTS
-# ============================================================
-
+# =====================================================
+# 🔹 FLASK ROUTES (WEB UI)
+# =====================================================
 @app.route("/")
 def home():
-    return "3-Candle Break Bot Running (with logs + performance + signals)."
+    return "3-Candle Break Bot Running (with Win-Rate Tracking)."
 
 @app.route("/healthz")
 def health():
@@ -444,48 +437,19 @@ def health():
 
 @app.route("/test")
 def test_message():
-    send_telegram("🚀 Test Message: Bot is online!")
-    return "Sent"
-
-@app.route("/signals")
-def view_signals():
-    if not signal_history:
-        return "<h1>No signals yet.</h1>"
-
-    html = """
-    <h1>All Signal History</h1>
-    <table border=1 cellpadding=6>
-        <tr>
-            <th>Time</th><th>Symbol</th><th>Side</th>
-            <th>EntryRef</th><th>SLRef</th><th>TPRef</th>
-            <th>Status</th>
-        </tr>
-    """
-    for s in reversed(signal_history):
-        html += f"""
-        <tr>
-            <td>{s['time']}</td>
-            <td>{s['symbol']}</td>
-            <td>{s['side']}</td>
-            <td>{s['entry_ref']}</td>
-            <td>{s['sl_ref']}</td>
-            <td>{s['tp_ref']}</td>
-            <td>{s['status']}</td>
-        </tr>
-        """
-    html += "</table>"
-    return html
+    send_telegram("🚀 *Test Message:* Your bot is working!")
+    return "Test message sent!"
 
 @app.route("/logs")
 def view_logs():
     if not logs:
-        return "<h1>No trades yet.</h1>"
+        return "<h1>No signals yet.</h1>"
 
     html = """
-    <h1>Trade Logs</h1>
+    <h1>3-Candle Bot Logs</h1>
     <table border=1 cellpadding=6>
         <tr>
-            <th>Time</th><th>Symbol</th><th>Side</th>
+            <th>Time (NY)</th><th>Symbol</th><th>Side</th>
             <th>Entry</th><th>SL</th><th>TP</th>
             <th>Status</th><th>Result</th>
         </tr>
@@ -499,25 +463,26 @@ def view_logs():
             <td>{log['entry']}</td>
             <td>{log['sl']}</td>
             <td>{log['tp']}</td>
-            <td>{log['status']}</td>
-            <td>{log['result']}</td>
+            <td>{log.get('status', '')}</td>
+            <td>{log.get('result', '')}</td>
         </tr>
         """
     html += "</table>"
     return html
+
 
 @app.route("/performance")
 def performance():
     total = len(closed_trades)
     wins = sum(1 for t in closed_trades if t["status"] == "WIN")
     losses = sum(1 for t in closed_trades if t["status"] == "LOSS")
-    be = sum(1 for t in closed_trades if t["status"] == "BE")
-    total_r = sum(t["r_multiple"] for t in closed_trades)
-    win_rate = (wins / total * 100) if total > 0 else 0
+    expired = sum(1 for t in closed_trades if t["status"] == "EXPIRED")
+    total_r = sum(t.get("r_multiple", 0.0) for t in closed_trades)
+    win_rate = (wins / total * 100) if total > 0 else 0.0
 
     html = "<h1>Performance</h1>"
     html += f"<p>Total closed trades: <b>{total}</b></p>"
-    html += f"<p>Wins: <b>{wins}</b> | Losses: <b>{losses}</b> | BE: <b>{be}</b></p>"
+    html += f"<p>Wins: <b>{wins}</b> | Losses: <b>{losses}</b> | Expired: <b>{expired}</b></p>"
     html += f"<p>Win rate: <b>{win_rate:.1f}%</b></p>"
     html += f"<p>Total R: <b>{total_r:+.2f}R</b></p>"
 
@@ -526,10 +491,9 @@ def performance():
         html += """
         <table border=1 cellpadding=6>
             <tr>
-                <th>Entry Time</th><th>Symbol</th><th>Side</th>
+                <th>Time (NY)</th><th>Symbol</th><th>Side</th>
                 <th>Entry</th><th>SL</th><th>TP</th>
-                <th>Exit Time</th><th>Exit Price</th>
-                <th>Status</th><th>R</th>
+                <th>Exit Time (NY)</th><th>Exit Price</th><th>Status</th><th>R</th>
             </tr>
         """
         for t in reversed(closed_trades):
@@ -541,10 +505,10 @@ def performance():
                 <td>{t['entry']:.2f}</td>
                 <td>{t['sl']:.2f}</td>
                 <td>{t['tp']:.2f}</td>
-                <td>{t['exit_time_ny']}</td>
-                <td>{t['exit_price']:.2f}</td>
+                <td>{t.get('exit_time_ny', '')}</td>
+                <td>{t.get('exit_price', '')}</td>
                 <td>{t['status']}</td>
-                <td>{t['r_multiple']:+.2f}R</td>
+                <td>{t.get('r_multiple', 0.0):+.2f}R</td>
             </tr>
             """
         html += "</table>"
@@ -552,10 +516,11 @@ def performance():
     return html
 
 
-# ============================================================
-# 🔹 START SERVER + BOT THREAD
-# ============================================================
+# =====================================================
+# 🔹 START THREAD
+# =====================================================
+strategy_thread = threading.Thread(target=strategy_loop, daemon=True)
+strategy_thread.start()
+
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
